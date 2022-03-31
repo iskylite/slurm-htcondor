@@ -1,0 +1,262 @@
+#!/usr/bin/env perl
+
+use Slurm;
+
+my $htc_sub_file;
+my $args;
+my $nodes;
+my $is_clear;
+
+$args = @ARGV;
+if ( $args > 1 ) {
+    print "usage: $0 [-c]\n";
+    print "\tgenerate condor submit desc file and submit the job, wait for complete.\n";
+    print "Option:\n";
+    print "\t-c   clear temp condor submit desc file.\n";
+    print "\n";
+    print "Desc Example:\n";
+    print "\t#HTC -g executable=/bin/echo\n";
+    print "\t#HTC -j initialdir=dir0 arguments=\"yhsubmit\" queue=1\n";
+    print "\n";
+    exit 1;
+}
+
+if (@ARGV[0] eq "-c") {
+    $is_clear = true;
+    print "INFO: will clear submit desc file.\n";
+} else {
+    $is_clear = false;
+}
+
+# grab current working directory for initial dir in system using automounter
+$pwd = `pwd`;
+chomp $pwd;
+
+# set up environment for running something in the current directory in case
+# they want to run something in the current working directory and they
+# don't specify a "./" infront of it.
+$ENV{'PATH'} .= ":.";
+
+if ( !exists($ENV{'SLURM_JOB_ID'}) ) {
+    &abort("Not found SLURM_JOB_ID.");
+}
+if ( !exists($ENV{'SLURM_JOB_NODELIST'}) ) {
+    &abort("Not found SLURM_JOB_NODELIST.");
+}
+
+$slurm_job_id = $ENV{'SLURM_JOB_ID'};
+$nodes = $ENV{'SLURM_JOB_NODELIST'};
+$htc_sub_file = sprintf("htc.%s.sub", $slurm_job_id);
+
+# setup cleanup subroutine and error handlers
+sub cleanfiles {
+    if ($is_clear) {
+        unlink $htc_sub_file;
+    }
+    # unlink ".condor_run.$$", ".condor_submit.$$", ".condor_log.$$";
+    # unlink ".condor_out.$$", ".condor_error.$$";
+}
+
+sub abort {
+    `condor_rm $cluster 2>&1 > /dev/null` if defined($cluster);
+    &cleanfiles;
+    die @_;
+}
+
+sub handler {
+    local($sig) = @_;
+    &abort("Killed by SIG$sig.\n");
+}
+
+$SIG{'HUP'} = 'handler';
+$SIG{'INT'} = 'handler';
+$SIG{'QUIT'} = 'handler';
+$SIG{'TERM'} = 'handler';
+
+# get slurm sbatch file
+open(INFO, "scontrol show job $slurm_job_id 2>&1 |") || 
+    &abort("Failed to get job($slurm_job_id) info. \n");
+while(<INFO>) {
+    if (/^\s+Command=(.+)/) {
+        ($batch_file) = $1;
+    }
+}
+close(INFO)||&abort("Failed to close job info, Please check you command.\n");
+
+# HTC config in batch file
+my @htc_gs; # global config file list
+my @htc_js; # job step info list
+
+# generate Machine Requirement
+my @machines;
+my $hl = Slurm::Hostlist::create($nodes);
+while(my $node = $hl->shift()) {
+    push(@machines, sprintf("Machine == \"%s\"", $node));
+}
+push(@htc_gs, sprintf("Requirement = ( %s )", join(" || ", @machines)));
+
+# analyze slurm batch file to get htc desc
+open(SBATCH, "<$batch_file") || &abort("Failed to open $batch_file.\n");
+while(<SBATCH>) {
+    if (/^\s*#HTC\s+-g\s+(.*)/) {
+        # global
+        my @htc_g_classads = split(/[\s]+/, $1);
+        #  handle space in substr
+        my $htc_g_classads_size =  scalar @htc_g_classads;
+        for (my $i =0; $i < $htc_g_classads_size; $i=$i+1) {
+            if (@htc_g_classads[$i] =~ /.*=.*/) {
+		# nothing
+            } else {
+		if ($i != 0) {
+                    @htc_g_classads[$i-1] = sprintf("%s %s", @htc_g_classads[$i-1], @htc_g_classads[$i]);
+                }
+	    }
+        }
+	print "htc_g_classads: @htc_g_classads\nhtc_g_classads_size: $htc_g_classads_size\n";
+        # fix queue
+        foreach my $htc_g_classad (@htc_g_classads) {
+            if ($htc_g_classad =~ /(.*)=.*/) {
+                if ($1 eq "initialdir" || $1 eq "queue") {
+                    # no queue
+                    &abort("syntax error: found $1 in global config.\n");
+                } else {
+                    push(@htc_gs, $htc_g_classad);
+                }
+            } 
+        }
+    } elsif (/^\s*#HTC\s+-j\s+(.*)/) {
+        # job
+        my @htc_j_classads = split(/[\s]+/, $1);
+        #  handle space in substr
+        my $htc_j_classads_size =  scalar @htc_j_classads;
+        for (my $i =0; $i < $htc_j_classads_size; $i=$i+1) {
+            if (@htc_j_classads[$i] =~ /^.*=.*/) {
+		# nothing
+            } else {
+		if ($i != 0) {
+                    @htc_j_classads[$i-1] = sprintf("%s %s", @htc_j_classads[$i-1], @htc_j_classads[$i]);
+                } 
+	    }
+        }
+        # fix queue
+        my @htc_j;
+        my $htc_j_queue = "queue\n";
+        my $has_out = false;
+        my $has_log = false;
+        my $has_error = false;
+        foreach my $htc_j_classad (@htc_j_classads) {
+            if ($htc_j_classad =~ /(.*)=(.*)/) {
+                if ($1 eq "initialdir") {
+                    unshift(@htc_j, $htc_j_classad);
+                } elsif ($1 eq "queue") {
+                    if ($2 == 1) {
+                        $htc_j_queue = "queue\n"; 
+                    } else {
+                        $htc_j_queue = sprintf("queue %s\n", $2);
+                    }
+                } elsif ($1 eq "output") {
+                    $has_out = true;
+		    push(@htc_j, $htc_j_classad);
+                } elsif ($1 eq "error") {
+                    $has_error = true;
+		    push(@htc_j, $htc_j_classad);
+                } elsif ($1 eq "log") {
+                    $has_log = true;
+		    push(@htc_j, $htc_j_classad);
+                } else {
+		    push(@htc_j, $htc_j_classad);
+		}
+            } 
+        }
+        if ($has_out eq false) {
+            push(@htc_j, sprintf("output=htc-%s.\$(Cluster).\$(Process).out", $slurm_job_id));
+        } 
+        if ($has_error eq false) {
+            push(@htc_j, sprintf("error=htc-%s.\$(Cluster).\$(Process).error", $slurm_job_id));
+        }
+        if ($has_log eq false) {
+            push(@htc_j, sprintf("log=htc-%s.\$(Cluster).\$(Process).log", $slurm_job_id));
+        }
+        push(@htc_j, $htc_j_queue);
+        @htc_js = (@htc_js, @htc_j);
+    }
+}
+close(SBATCH) || &abort("Failed to close slurm batch file.\n");
+
+# generate htc submit file
+open(HTC, ">$htc_sub_file") || &abort("Failed to open $htc_sub_file.\n");
+# write global desc
+foreach my $htc_g (@htc_gs) {
+    print HTC $htc_g, "\n";
+}
+print HTC "should_transfer_files = IF_NEEDED\n";
+print HTC "notification = NEVER\n";
+print HTC "getenv = True\n";
+print HTC "\n";
+
+# write job step
+foreach my $htc_j (@htc_js) {
+    print HTC $htc_j, "\n";
+}
+close(HTC) || &abort("Failed to close $htc_sub_file.\n");
+
+undef $htc_gs;
+undef $htc_js;
+undef $machines;
+
+# submit the job; $cluster contains cluster number if successful
+open(SUBMIT, "condor_submit $htc_sub_file 2>&1 |") ||
+    &abort("Failed to run condor_submit.  Please check your path.\n");
+while(<SUBMIT>) {
+    if (/^(\d+) job\(s\) submitted to cluster (\d+)./) {
+	($job_nums) = $1;
+    ($cluster) = $2;
+    print "SUBMIT JOB: 
+	SLURM_JOB_ID: $slurm_job_id 
+	HTC_JOB_ID: $cluster 
+	JOB_STEP_NUM: $job_nums\n";
+    } elsif (/WARNING.*Invalid log file/ ||
+	     /WARNING.*is not writable by condor/) {
+	print STDERR $_;
+	&abort("Failed to submit Condor job.\n");
+    } else {
+	$submit_errors .= $_;
+    }
+}
+
+undef $job_nums;
+
+if (!close(SUBMIT) || !defined($cluster)) {
+    print STDERR $submit_errors;
+    &abort("Failed to submit Condor job.\n");
+}
+
+# watch the condor_q to see when the job completes
+print "\nWAITING COMPLETE ...\n";
+$status = 0;
+open(DONE, "condor_watch_q -clusters $cluster -exit all,done 2>&1 |") || 
+    &abort("Failed to run condor_watch_q, Please check you path.\n");
+
+print "\nBATCH     IDLE  RUN  DONE  TOTAL  JOB_IDS\n";
+
+while (<DONE>) {
+    if (/^Exiting with code (\d+) because of condition "all done" at \d+-\d+-\d+ \d+:\d+:\d+/) {
+        $status = $1;
+	print "\n...\n";
+	print STDOUT;
+    } elsif (/^ID:\s\d+\s+.+/) {
+	chomp;
+	print STDOUT;
+	print "\r";
+    }
+}
+
+close(DONE) || &abort("Failed to close command condor_watch_q.\n");
+
+undef $cluster;                 # indicate that job is no longer in queue
+undef $htc_sub_file;
+undef $args;
+undef $nodes;
+undef $is_clear;
+
+exit $status;			# exit with job's exit status
